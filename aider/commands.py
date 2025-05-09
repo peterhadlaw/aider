@@ -530,4 +530,1022 @@ class Commands:
 
         remaining = limit - total
         if remaining > 1024:
-            self.io.tool_output(f"{
+            self.io.tool_output(f"{remaining:,} tokens remaining")
+
+    def cmd_reasoning_effort(self, args):
+        "Set the reasoning effort parameter (for models that support it)"
+        args = args.strip()
+
+        if not args:
+            # Display current value if no argument provided
+            current_effort = self.coder.main_model.get_reasoning_effort()
+            if current_effort is not None:
+                self.io.tool_output(f"Current reasoning effort: {current_effort}")
+            else:
+                self.io.tool_output("No reasoning effort currently set")
+            return
+
+        # Set the reasoning effort
+        self.coder.main_model.set_reasoning_effort(args)
+        # Also set it for the editor model if applicable
+        self.coder.main_model.set_editor_reasoning_effort(args)
+        self.io.tool_output(f"Set reasoning effort to {args}")
+
+    def cmd_editor_reasoning_effort(self, args):
+        "Set the reasoning effort parameter for the editor model (for models that support it)"
+        args = args.strip()
+
+        # Check if there's a separate editor model
+        if (
+            self.coder.main_model.editor_model is None
+            or self.coder.main_model.editor_model is self.coder.main_model
+        ):
+            self.io.tool_warning("No separate editor model configured. Use /reasoning-effort instead.")
+            return
+
+        if not args:
+            # Display current value if no argument provided
+            current_effort = self.coder.main_model.editor_model.get_reasoning_effort()
+            if current_effort is not None:
+                self.io.tool_output(f"Current editor model reasoning effort: {current_effort}")
+            else:
+                self.io.tool_output("No reasoning effort currently set for editor model")
+            return
+
+        # Set the reasoning effort for the editor model
+        self.coder.main_model.editor_model.set_reasoning_effort(args)
+        self.io.tool_output(f"Set editor model reasoning effort to {args}")
+
+    def cmd_think_tokens(self, args):
+        "Set the thinking token budget (for models that support it)"
+        args = args.strip()
+
+        if not args:
+            # Display current value if no argument provided
+            current_budget = self.coder.main_model.get_thinking_tokens()
+            if current_budget is not None:
+                self.io.tool_output(f"Current thinking token budget: {current_budget}")
+            else:
+                self.io.tool_output("No thinking token budget currently set")
+            return
+
+        # Set the thinking tokens
+        raw_value = args
+        tokens = self.coder.main_model.parse_token_value(raw_value)
+        self.coder.main_model.set_thinking_tokens(tokens)
+        self.io.tool_output(f"Set thinking token budget to {tokens:,} tokens ({raw_value}).")
+
+    def cmd_run(self, cmd, add_on_nonzero_exit=False, add_to_chat=True):
+        "Run a command in the shell"
+        if not cmd:
+            self.io.tool_error("Usage: /run <command>")
+            return
+
+        cmd = cmd.strip()
+        self.io.tool_output(f"Running: {cmd}")
+
+        exit_code, output = run_cmd(cmd)
+
+        if output:
+            self.io.tool_output(output)
+
+        if exit_code:
+            self.io.tool_output(f"Command exited with status: {exit_code}")
+            if not add_on_nonzero_exit:
+                return
+
+        if add_to_chat:
+            # Add the command and its output to the chat
+            self.coder.cur_messages += [
+                dict(
+                    role="user",
+                    content=f"I ran the command: {cmd}\n\n```\n{output}\n```",
+                ),
+                dict(role="assistant", content="Thanks for sharing the output."),
+            ]
+
+        return output
+
+    def cmd_test(self, test_cmd):
+        "Run tests and fix any issues found"
+        if not test_cmd:
+            if not self.coder.test_cmd:
+                self.io.tool_error("No test command specified.")
+                return None
+            test_cmd = self.coder.test_cmd
+
+        output = self.cmd_run(test_cmd, add_on_nonzero_exit=True)
+        if not output:
+            self.io.tool_output("Tests passed!")
+            return None
+
+        return output
+
+    def cmd_undo(self, args):
+        "Undo the last aider commit"
+        if not self.coder.repo:
+            self.io.tool_error("No git repository found.")
+            return
+
+        # Get the current commit hash
+        commit = self.coder.repo.repo.head.commit
+
+        # Check if this is the first commit in the repo
+        if not commit.parents:
+            self.io.tool_error("Cannot undo the first commit in the repository.")
+            return
+
+        # Check if this is an aider commit
+        if commit.hexsha[:7] not in self.coder.aider_commit_hashes:
+            self.io.tool_error("Last commit was not made by aider.")
+            return
+
+        # Check if the commit had new files created
+        parent = commit.parents[0]
+        files = commit.stats.files.keys()
+        if any(parent.tree.find_missing_objects(files)):
+            self.io.tool_error(
+                "Cannot undo a commit that created new files. This would leave files untracked."
+            )
+            return
+
+        # Ensure there are no unstaged changes
+        if self.coder.repo.is_dirty():
+            dirty_files = self.coder.repo.get_dirty_files()
+            # Check if any dirty files are part of the commit to be reverted
+            if any(file in dirty_files for file in files):
+                self.io.tool_error(
+                    "Cannot undo last commit: working directory has unsaved changes to files from"
+                    " that commit."
+                )
+                return
+        try:
+            # Reset to the parent commit
+            self.coder.repo.repo.git.reset("--hard", "HEAD~1")
+            self.io.tool_output(
+                f"Successfully undid commit {commit.hexsha[:7]}: {commit.message.splitlines()[0]}"
+            )
+            return True
+        except Exception as e:
+            self.io.tool_error(f"Error undoing commit: {e}")
+            return False
+
+    def cmd_diff(self, args):
+        "Show changes in the git repository"
+        if not self.coder.repo:
+            self.io.tool_error("No git repository found.")
+            return
+
+        args = args.strip()
+
+        if args:
+            try:
+                # Try to parse the arguments as commit references
+                if ".." in args:
+                    start, end = args.split("..", 1)
+                    diff = self.coder.repo.diff_commits(True, start, end)
+                else:
+                    diff = self.coder.repo.diff_commits(True, args)
+            except ANY_GIT_ERROR as err:
+                self.io.tool_error(f"Error getting diff: {err}")
+                return
+        else:
+            # Default behavior: show changes between last two commits
+            diff = self.coder.repo.get_diffs(show_diff=True, context_lines=10)
+
+        if diff:
+            print(diff)
+        else:
+            self.io.tool_output("No changes found.")
+
+    def cmd_save(self, filename):
+        "Save the current session to a file"
+        if not filename:
+            filename = "aider-session.txt"
+        filename = filename.strip()
+
+        try:
+            commands = []
+
+            # Add commands for files in the session
+            for fname in self.coder.abs_fnames:
+                rel_fname = self.coder.get_rel_fname(fname)
+                commands.append(f"/add {rel_fname}")
+
+            # Add commands for read-only files
+            for fname in self.coder.abs_read_only_fnames:
+                rel_fname = self.coder.get_rel_fname(fname)
+                commands.append(f"/read-only {rel_fname}")
+
+            # Write commands to the file
+            with open(filename, "w", encoding=self.io.encoding) as f:
+                f.write("\n".join(commands))
+
+            self.io.tool_output(f"Session saved to {filename}")
+        except Exception as e:
+            self.io.tool_error(f"Error saving session: {e}")
+
+    def cmd_load(self, filename):
+        "Load a session from a file"
+        if not filename:
+            self.io.tool_error("Please provide a filename to load")
+            return
+        filename = filename.strip()
+
+        try:
+            with open(filename, "r", encoding=self.io.encoding) as f:
+                commands = f.read().splitlines()
+
+            for cmd in commands:
+                cmd = cmd.strip()
+                if not cmd or not cmd.startswith("/"):
+                    continue
+
+                # Parse the command
+                cmd_parts = cmd.split(None, 1)
+                cmd_name = cmd_parts[0][1:]  # Remove the leading slash
+                cmd_args = cmd_parts[1] if len(cmd_parts) > 1 else ""
+
+                # Skip commands that are only supported in interactive mode
+                if cmd_name in ["ask", "model", "editor-model", "weak-model", "chat-mode"]:
+                    self.io.tool_error(
+                        f"Command '{cmd}' is only supported in interactive mode, skipping."
+                    )
+                    continue
+
+                try:
+                    # Run the command
+                    self.do_run(cmd_name, cmd_args)
+                except SwitchCoder:
+                    # These commands require restarting the session, which we can't do in load
+                    self.io.tool_error(
+                        f"Command '{cmd}' is only supported in interactive mode, skipping."
+                    )
+                except Exception as e:
+                    self.io.tool_error(f"Error executing command '{cmd}': {e}")
+
+            self.io.tool_output(f"Session loaded from {filename}")
+        except Exception as e:
+            self.io.tool_error(f"Error loading session: {e}")
+
+    def cmd_editor(self, args):
+        "Edit all active files in an external editor"
+        if not self.coder.abs_fnames:
+            self.io.tool_output("No files to edit. Use /add to add files to the chat.")
+            return
+
+        # Make a list of files to edit
+        files_to_edit = list(self.coder.abs_fnames)
+        read_only_warning = ""
+        if self.coder.abs_read_only_fnames:
+            read_only_warning = (
+                "\nNote: Read-only files are not included. Use /add to convert them to editable."
+            )
+
+        self.io.tool_output(f"Opening editor with {len(files_to_edit)} files.{read_only_warning}")
+
+        # Find the editor to use
+        editor = self.editor
+        if not editor:
+            # Fall back to environment variables
+            editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+            if not editor:
+                self.io.tool_error(
+                    "No editor specified. Set one with --editor or the VISUAL/EDITOR environment"
+                    " variables."
+                )
+                return
+
+        # Prepare the command
+        cmd = f"{editor} {' '.join(map(repr, files_to_edit))}"
+
+        # Run the editor
+        exit_code, output = run_cmd(cmd)
+        if exit_code != 0:
+            self.io.tool_error(f"Editor exited with status {exit_code}")
+            if output:
+                self.io.tool_output(output)
+
+    def cmd_paste(self, args):
+        "Apply content from clipboard to edit files"
+        try:
+            content = pyperclip.paste()
+        except pyperclip.PyperclipException as e:
+            self.io.tool_error(f"Unable to access clipboard: {e}")
+            return
+
+        if not content:
+            self.io.tool_error("Clipboard is empty")
+            return
+
+        self.coder.partial_response_content = content
+        self.coder.apply_updates()
+
+    def cmd_copy(self, args):
+        "Copy the last assistant message to the clipboard"
+        all_messages = self.coder.done_messages + self.coder.cur_messages
+        assistant_messages = [msg for msg in all_messages if msg["role"] == "assistant"]
+
+        if not assistant_messages:
+            self.io.tool_error("No assistant messages found to copy.")
+            return
+
+        last_message = assistant_messages[-1]["content"]
+        try:
+            pyperclip.copy(last_message)
+            # Show a preview of the copied content (first 50 chars)
+            preview = last_message[:50] + ("..." if len(last_message) > 50 else "")
+            self.io.tool_output(f"Copied last assistant message to clipboard. Preview: {preview}")
+        except pyperclip.PyperclipException as e:
+            self.io.tool_error(f"Failed to copy to clipboard: {e}")
+
+    def cmd_edit(self, args):
+        "Edit the last prompt using an external editor"
+        all_messages = self.coder.done_messages + self.coder.cur_messages
+        user_messages = [msg for msg in all_messages if msg["role"] == "user"]
+
+        if not user_messages:
+            self.io.tool_error("No user messages found to edit.")
+            return
+
+        last_message = user_messages[-1]["content"]
+        try:
+            edited_content = pipe_editor(last_message, editor=self.editor)
+            if edited_content != last_message:
+                self.io.tool_output("Message edited. Sending to assistant...")
+                self.coder.run(with_message=edited_content)
+            else:
+                self.io.tool_output("No changes made to the message.")
+        except Exception as e:
+            self.io.tool_error(f"Error editing message: {e}")
+
+    # Completions for command arguments
+
+    def completions_raw_add(self, document, complete_event, remaining_text, words):
+        if len(words) > 1:
+            # Get completions for subsequent arguments (multiple files)
+            # Exclude files that are already in abs_fnames to avoid duplicating them
+            existing_files = set([self.coder.get_rel_fname(f) for f in self.coder.abs_fnames])
+            addable_files = set(self.coder.get_addable_relative_files()) - existing_files
+            
+            # Also check if files from abs_read_only_fnames are in the repository,
+            # so they can be promoted to editable
+            read_only_files = [
+                self.coder.get_rel_fname(f) for f in self.coder.abs_read_only_fnames
+            ]
+            addable_files.update(set(read_only_files))
+            
+            # Get the current word being completed
+            current_word = words[-1]
+            completions = []
+            
+            for fname in addable_files:
+                if fname.startswith(current_word):
+                    display = f"{fname}"
+                    completions.append(Completion(fname, start_position=-len(current_word), display=display))
+            
+            return completions
+
+        # First argument handling (path completion)
+        completer = PathCompleter(
+            only_directories=False,
+            expanduser=True,
+        )
+        return completer.get_completions(document, complete_event)
+
+    def cmd_help(self, args):
+        "Show help about using aider"
+        if not self.help:
+            self.help = Help()
+        return self.help.full_help(args)
+
+    def cmd_ask(self, question):
+        "Switch to Ask Mode and ask the question"
+        if not question:
+            self.io.tool_error("Usage: /ask <question about your code>")
+            return
+
+        # Switch to Ask mode
+        raise SwitchCoder(
+            edit_format="ask",
+            summarize_from_coder=False,
+            placeholder=question,
+        )
+
+    def cmd_voice(self, args):
+        "Send a message from voice input"
+        language = self.voice_language
+        device = self.voice_input_device
+        audio_format = self.voice_format
+
+        if not self.voice:
+            try:
+                # Check if we have the required dependencies
+                import speech_recognition  # noqa
+                import sounddevice  # noqa
+
+                if audio_format in ["mp3", "webm"]:
+                    # Try to load ffmpeg for mp3/webm support
+                    import ffmpeg  # noqa
+            except ImportError as e:
+                missing_package = str(e).split("'")[1]
+                self.io.tool_error(f"Missing required package: {missing_package}")
+                self.io.tool_output(
+                    "Please install voice dependencies with:"
+                    " pip install aider-chat[voice]"
+                    f" or pip install {missing_package}"
+                )
+                return
+
+            # Initialize the voice module
+            try:
+                self.voice = voice.Voice(device_name=device, audio_format=audio_format)
+            except Exception as e:
+                self.io.tool_error(f"Error initializing voice module: {e}")
+                return
+
+        try:
+            # Record and transcribe voice
+            self.io.tool_output("🎙️ Recording... (Press Ctrl+C to stop)")
+            transcription = self.voice.record_and_transcribe(language=language)
+            if transcription:
+                self.io.tool_output(f"🔊 Transcribed: {transcription}")
+                self.coder.run(with_message=transcription)
+            else:
+                self.io.tool_output("❌ No speech detected or transcription failed.")
+        except KeyboardInterrupt:
+            self.io.tool_output("Recording stopped by user.")
+        except Exception as e:
+            self.io.tool_error(f"Error during voice recording: {e}")
+
+    def cmd_browse(self, args):
+        "Open a URL in the browser"
+        url = args.strip()
+        if not url:
+            self.io.tool_error("Please provide a URL to open")
+            return
+
+        # Add http:// prefix if missing
+        if not url.startswith(("http://", "https://", "file://")):
+            url = "https://" + url
+
+        self.io.offer_url(url, f"Open {url}?", allow_never=False)
+
+    def cmd_add(self, args):
+        "Add new or existing files to the chat"
+
+        if not args:
+            self.io.tool_output("Usage: /add <file> [<file> ...]")
+            return
+
+        # Allow quoting paths with spaces
+        # Need to handle both 'file.txt' and "file.txt"
+        def split_args(s):
+            inside_quotes = False
+            quote_char = None
+            parts = []
+            current = []
+
+            for c in s:
+                if c in "\"'":
+                    if not inside_quotes:
+                        inside_quotes = True
+                        quote_char = c
+                    elif c == quote_char:
+                        inside_quotes = False
+                        quote_char = None
+                    else:
+                        current.append(c)
+                elif c.isspace() and not inside_quotes:
+                    if current:
+                        parts.append("".join(current))
+                        current = []
+                else:
+                    current.append(c)
+
+            if current:
+                parts.append("".join(current))
+
+            # Strip quotes from parts
+            return [p.strip("\"'") for p in parts]
+
+        filenames = split_args(args)
+
+        fnames_to_abs_fnames = {}
+        for filename in filenames:
+            # Handle glob patterns
+            import glob
+
+            # Verify path is not trying to escape root directory
+            abs_path = os.path.abspath(filename)
+            root_path = (
+                os.path.abspath(self.coder.root) if self.coder.root else os.path.abspath(os.curdir)
+            )
+            if not abs_path.startswith(root_path):
+                self.io.tool_error(f"Path {filename} is outside the root directory {root_path}")
+                continue
+
+            match_paths = glob.glob(filename, recursive=True)
+            if match_paths:
+                for match_path in match_paths:
+                    try:
+                        if os.path.isdir(match_path):
+                            # Add all files in the directory
+                            for root, _, files in os.walk(match_path):
+                                for fname in files:
+                                    file_path = os.path.join(root, fname)
+                                    fnames_to_abs_fnames[file_path] = self.coder.abs_root_path(
+                                        file_path
+                                    )
+                        else:
+                            # Add individual file
+                            fnames_to_abs_fnames[match_path] = self.coder.abs_root_path(match_path)
+                    except OSError as e:
+                        # This handles path-specific errors like permission issues
+                        self.io.tool_error(f"Error accessing {match_path}: {e}")
+            else:
+                # If the file doesn't exist, create it if confirmed
+                abs_fname = self.coder.abs_root_path(filename)
+                if os.path.exists(abs_fname):
+                    self.io.tool_error(f"File not found: {filename}")
+                    continue
+
+                if self.coder.repo and self.coder.repo.ignored_file(filename):
+                    self.io.tool_error(f"File {filename} is ignored by git/aider")
+                    continue
+
+                if not self.io.confirm_ask(f"Create new file {filename}?", default="y"):
+                    continue
+
+                try:
+                    # Ensure the directory exists
+                    os.makedirs(os.path.dirname(abs_fname) or ".", exist_ok=True)
+                    # Create the file
+                    Path(abs_fname).touch()
+                    fnames_to_abs_fnames[filename] = abs_fname
+                except OSError as e:
+                    self.io.tool_error(f"Error creating {filename}: {e}")
+
+        for fname, abs_fname in fnames_to_abs_fnames.items():
+            try:
+                if self.coder.repo and self.coder.repo.ignored_file(fname):
+                    self.io.tool_error(f"File {fname} is ignored by git/aider")
+                    continue
+
+                # Check if the file is in the read-only set
+                if any(
+                    os.path.samefile(abs_fname, ro_fname)
+                    for ro_fname in self.coder.abs_read_only_fnames
+                ):
+                    # If the file is in the repository, we can add it
+                    if self.coder.repo and self.coder.repo.file_in_repo(fname):
+                        # Remove from read-only set
+                        self.coder.abs_read_only_fnames.remove(abs_fname)
+                    else:
+                        # Skip read-only files that aren't in the repo
+                        self.io.tool_warning(
+                            f"File {fname} is currently read-only and not in the repository. Cannot"
+                            " convert to editable."
+                        )
+                        continue
+
+                encoding_errors = False
+                if not is_image_file(fname):
+                    # Test if we can read the file with the expected encoding
+                    try:
+                        content = self.io.read_text(abs_fname)
+                        if content is None:
+                            encoding_errors = True
+                    except (UnicodeDecodeError, IsADirectoryError):
+                        encoding_errors = True
+
+                if encoding_errors:
+                    self.io.tool_error(
+                        f"Unable to read {fname} with encoding {self.io.encoding}. Skipping."
+                    )
+                    continue
+
+                # Actually add the file
+                if self.coder.allowed_to_edit(fname):
+                    self.io.tool_output(f"Added {fname}")
+                else:
+                    self.io.tool_output(f"Skipped {fname}")
+
+            except OSError as e:
+                # Handle specific OSError subtypes
+                if isinstance(e, IsADirectoryError):
+                    self.io.tool_error(f"Cannot add {fname}: It is a directory")
+                else:
+                    self.io.tool_error(f"Error adding {fname}: {e}")
+
+    def cmd_drop(self, args):
+        "Drop files from the chat session"
+
+        if not args:
+            if self.original_read_only_fnames:
+                self.io.tool_output(
+                    "Dropping all files from the chat session except originally read-only files."
+                )
+                # Keep only the original read-only files
+                to_keep = set()
+                for abs_fname in self.coder.abs_read_only_fnames:
+                    rel_fname = self.coder.get_rel_fname(abs_fname)
+                    if (
+                        abs_fname in self.original_read_only_fnames
+                        or rel_fname in self.original_read_only_fnames
+                    ):
+                        to_keep.add(abs_fname)
+                self.coder.abs_read_only_fnames = to_keep
+                self.coder.abs_fnames = set()
+            else:
+                self.io.tool_output("Dropping all files from the chat session.")
+                self.coder.abs_fnames = set()
+                self.coder.abs_read_only_fnames = set()
+            return
+
+        # Allow quoting paths with spaces
+        def split_args(s):
+            inside_quotes = False
+            quote_char = None
+            parts = []
+            current = []
+
+            for c in s:
+                if c in "\"'":
+                    if not inside_quotes:
+                        inside_quotes = True
+                        quote_char = c
+                    elif c == quote_char:
+                        inside_quotes = False
+                        quote_char = None
+                    else:
+                        current.append(c)
+                elif c.isspace() and not inside_quotes:
+                    if current:
+                        parts.append("".join(current))
+                        current = []
+                else:
+                    current.append(c)
+
+            if current:
+                parts.append("".join(current))
+
+            # Strip quotes from parts
+            return [p.strip("\"'") for p in parts]
+
+        filenames = split_args(args)
+
+        for filename in filenames:
+            # Handle glob patterns
+            import glob
+
+            match_paths = glob.glob(filename, recursive=True)
+            if match_paths:
+                for match_path in match_paths:
+                    if os.path.isdir(match_path):
+                        # Drop all files in the directory
+                        dir_path = os.path.abspath(match_path)
+                        self.coder.abs_fnames = set(
+                            f
+                            for f in self.coder.abs_fnames
+                            if not os.path.abspath(f).startswith(dir_path)
+                        )
+                        self.coder.abs_read_only_fnames = set(
+                            f
+                            for f in self.coder.abs_read_only_fnames
+                            if not os.path.abspath(f).startswith(dir_path)
+                        )
+                        self.io.tool_output(f"Dropped all files in directory {match_path}")
+                    else:
+                        # Drop individual file
+                        abs_path = os.path.abspath(match_path)
+                        # Handle paths that need resolution
+                        dropped = False
+                        for f in list(self.coder.abs_fnames):
+                            try:
+                                if os.path.samefile(f, abs_path):
+                                    self.coder.abs_fnames.remove(f)
+                                    dropped = True
+                                    self.io.tool_output(f"Dropped {match_path}")
+                                    break
+                            except OSError:
+                                # Handle case where file doesn't exist anymore
+                                continue
+
+                        for f in list(self.coder.abs_read_only_fnames):
+                            try:
+                                if os.path.samefile(f, abs_path):
+                                    self.coder.abs_read_only_fnames.remove(f)
+                                    dropped = True
+                                    self.io.tool_output(f"Dropped read-only file {match_path}")
+                                    break
+                            except OSError:
+                                continue
+
+                        if not dropped:
+                            # Try with relative paths
+                            abs_fname = self.coder.abs_root_path(match_path)
+                            if abs_fname in self.coder.abs_fnames:
+                                self.coder.abs_fnames.remove(abs_fname)
+                                dropped = True
+                                self.io.tool_output(f"Dropped {match_path}")
+                            elif abs_fname in self.coder.abs_read_only_fnames:
+                                self.coder.abs_read_only_fnames.remove(abs_fname)
+                                dropped = True
+                                self.io.tool_output(f"Dropped read-only file {match_path}")
+
+                        if not dropped:
+                            # One more check with short filenames
+                            for f in list(self.coder.abs_fnames):
+                                rel_f = self.coder.get_rel_fname(f)
+                                if rel_f == match_path or os.path.basename(f) == match_path:
+                                    self.coder.abs_fnames.remove(f)
+                                    dropped = True
+                                    self.io.tool_output(f"Dropped {match_path}")
+                                    break
+
+                            for f in list(self.coder.abs_read_only_fnames):
+                                rel_f = self.coder.get_rel_fname(f)
+                                if rel_f == match_path or os.path.basename(f) == match_path:
+                                    self.coder.abs_read_only_fnames.remove(f)
+                                    dropped = True
+                                    self.io.tool_output(f"Dropped read-only file {match_path}")
+                                    break
+
+                        if not dropped:
+                            self.io.tool_error(f"File {match_path} not found in chat")
+            else:
+                # Try to find the file using various strategies
+                abs_fname = self.coder.abs_root_path(filename)
+                dropped = False
+
+                # First try direct match
+                if abs_fname in self.coder.abs_fnames:
+                    self.coder.abs_fnames.remove(abs_fname)
+                    dropped = True
+                    self.io.tool_output(f"Dropped {filename}")
+                elif abs_fname in self.coder.abs_read_only_fnames:
+                    self.coder.abs_read_only_fnames.remove(abs_fname)
+                    dropped = True
+                    self.io.tool_output(f"Dropped read-only file {filename}")
+
+                if not dropped:
+                    # Try by filename only
+                    for f in list(self.coder.abs_fnames):
+                        if os.path.basename(f) == filename:
+                            self.coder.abs_fnames.remove(f)
+                            dropped = True
+                            self.io.tool_output(f"Dropped {filename}")
+                            break
+
+                    for f in list(self.coder.abs_read_only_fnames):
+                        if os.path.basename(f) == filename:
+                            self.coder.abs_read_only_fnames.remove(f)
+                            dropped = True
+                            self.io.tool_output(f"Dropped read-only file {filename}")
+                            break
+
+                if not dropped:
+                    # Try by relative filename
+                    for f in list(self.coder.abs_fnames):
+                        rel_f = self.coder.get_rel_fname(f)
+                        if rel_f == filename:
+                            self.coder.abs_fnames.remove(f)
+                            dropped = True
+                            self.io.tool_output(f"Dropped {filename}")
+                            break
+
+                    for f in list(self.coder.abs_read_only_fnames):
+                        rel_f = self.coder.get_rel_fname(f)
+                        if rel_f == filename:
+                            self.coder.abs_read_only_fnames.remove(f)
+                            dropped = True
+                            self.io.tool_output(f"Dropped read-only file {filename}")
+                            break
+
+                if not dropped:
+                    try:
+                        # Last attempt using samefile for path normalization
+                        abs_path = os.path.abspath(filename)
+                        for f in list(self.coder.abs_fnames):
+                            try:
+                                if os.path.samefile(f, abs_path):
+                                    self.coder.abs_fnames.remove(f)
+                                    dropped = True
+                                    self.io.tool_output(f"Dropped {filename}")
+                                    break
+                            except OSError:
+                                continue
+
+                        for f in list(self.coder.abs_read_only_fnames):
+                            try:
+                                if os.path.samefile(f, abs_path):
+                                    self.coder.abs_read_only_fnames.remove(f)
+                                    dropped = True
+                                    self.io.tool_output(f"Dropped read-only file {filename}")
+                                    break
+                            except OSError:
+                                continue
+                    except OSError:
+                        pass
+
+                if not dropped:
+                    self.io.tool_error(f"File {filename} not found in chat")
+
+    def cmd_read_only(self, args):
+        "Add read-only files to the chat (won't be edited)"
+        
+        if not args:
+            # If no arguments, convert all editable files to read-only
+            if self.coder.abs_fnames:
+                to_convert = list(self.coder.abs_fnames)
+                self.coder.abs_read_only_fnames.update(to_convert)
+                self.coder.abs_fnames.clear()
+                self.io.tool_output("Converted all editable files to read-only mode.")
+            else:
+                self.io.tool_output("No editable files to convert. Use /read-only <file> to add read-only files.")
+            return
+
+        # Allow quoting paths with spaces
+        def split_args(s):
+            inside_quotes = False
+            quote_char = None
+            parts = []
+            current = []
+
+            for c in s:
+                if c in "\"'":
+                    if not inside_quotes:
+                        inside_quotes = True
+                        quote_char = c
+                    elif c == quote_char:
+                        inside_quotes = False
+                        quote_char = None
+                    else:
+                        current.append(c)
+                elif c.isspace() and not inside_quotes:
+                    if current:
+                        parts.append("".join(current))
+                        current = []
+                else:
+                    current.append(c)
+
+            if current:
+                parts.append("".join(current))
+
+            # Strip quotes from parts
+            return [p.strip("\"'") for p in parts]
+
+        filenames = split_args(args)
+        added_files = []
+
+        for filename in filenames:
+            # Handle glob patterns
+            import glob
+
+            # Handle home directory expansion
+            filename = os.path.expanduser(filename)
+
+            match_paths = glob.glob(filename, recursive=True)
+            if match_paths:
+                for match_path in match_paths:
+                    try:
+                        if os.path.isdir(match_path):
+                            # Add all files in the directory
+                            for root, _, files in os.walk(match_path):
+                                for fname in files:
+                                    file_path = os.path.join(root, fname)
+                                    abs_fname = os.path.abspath(file_path)
+                                    if self._add_read_only_file(abs_fname):
+                                        added_files.append(file_path)
+                        else:
+                            # Add individual file
+                            abs_fname = os.path.abspath(match_path)
+                            if self._add_read_only_file(abs_fname):
+                                added_files.append(match_path)
+                    except OSError as e:
+                        self.io.tool_error(f"Error accessing {match_path}: {e}")
+            else:
+                self.io.tool_error(f"No matches found for: {filename}")
+
+        if added_files:
+            self.io.tool_output(f"Added {len(added_files)} files as read-only")
+
+    def _add_read_only_file(self, abs_fname):
+        """Helper to add a single read-only file."""
+        # Check if file can be read with the current encoding
+        try:
+            # Special case for images with vision models
+            if is_image_file(abs_fname):
+                if hasattr(self.coder.main_model, "name") and "vision" in self.coder.main_model.name:
+                    self.coder.abs_read_only_fnames.add(abs_fname)
+                    return True
+                else:
+                    self.io.tool_error(
+                        f"Image files like {os.path.basename(abs_fname)} require a vision model."
+                    )
+                    return False
+            
+            # Try to read the file content
+            content = self.io.read_text(abs_fname)
+            if content is None:
+                return False
+            
+            # Check if already in editable files
+            for existing in self.coder.abs_fnames:
+                try:
+                    if os.path.samefile(existing, abs_fname):
+                        # Remove from editable and add to read-only
+                        self.coder.abs_fnames.remove(existing)
+                        self.coder.abs_read_only_fnames.add(abs_fname)
+                        self.io.tool_output(
+                            f"Converted {os.path.basename(abs_fname)} from editable to read-only."
+                        )
+                        return True
+                except OSError:
+                    continue
+            
+            # Add as new read-only file if not already present
+            for existing in self.coder.abs_read_only_fnames:
+                try:
+                    if os.path.samefile(existing, abs_fname):
+                        # Already in read-only files
+                        return False
+                except OSError:
+                    continue
+            
+            # Add new read-only file
+            self.coder.abs_read_only_fnames.add(abs_fname)
+            return True
+            
+        except (UnicodeDecodeError, IsADirectoryError) as e:
+            self.io.tool_error(f"Error reading {os.path.basename(abs_fname)}: {e}")
+            return False
+        except Exception as e:
+            self.io.tool_error(f"Unexpected error with {os.path.basename(abs_fname)}: {e}")
+            return False
+
+    def cmd_files(self, args):
+        "List all files in the chat session"
+        editable_files = [self.coder.get_rel_fname(f) for f in self.coder.abs_fnames]
+        read_only_files = [self.coder.get_rel_fname(f) for f in self.coder.abs_read_only_fnames]
+        
+        # Sort files for better readability
+        editable_files.sort()
+        read_only_files.sort()
+        
+        if not editable_files and not read_only_files:
+            self.io.tool_output("No files in the chat session. Use /add or /read-only to add files.")
+            return
+        
+        if editable_files:
+            self.io.tool_output("\nEditable files:")
+            for f in editable_files:
+                self.io.tool_output(f"  - {f}")
+        
+        if read_only_files:
+            self.io.tool_output("\nRead-only files:")
+            for f in read_only_files:
+                self.io.tool_output(f"  - {f}")
+
+    def cmd_capture(self, args):
+        "Capture and share a screenshot"
+        try:
+            # Try to get a screenshot from clipboard
+            image = None
+            try:
+                image = ImageGrab.grabclipboard()
+                if image:
+                    self.io.tool_output("Found image in clipboard.")
+            except Exception:
+                pass
+            
+            # If no clipboard image, take a screenshot
+            if not image:
+                self.io.tool_output("Taking screenshot... (click to capture)")
+                image = ImageGrab.grab()
+                
+            if not image:
+                self.io.tool_error("Failed to capture screenshot.")
+                return
+            
+            # Save the image to a temporary file
+            temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            temp_path = temp_file.name
+            temp_file.close()
+            
+            image.save(temp_path)
+            self.io.tool_output(f"Screenshot saved temporarily as {temp_path}")
+            
+            # Check if the model supports images
+            if not hasattr(self.coder.main_model, "name") or "vision" not in self.coder.main_model.name:
+                self.io.tool_warning(
+                    "Your current model doesn't support images. The screenshot will be referenced but not processed."
+                )
+            
+            # Add to chat with a message
+            message = f"Here's a screenshot I captured:\n\n![Screenshot]({temp_path})"
+            self.coder.run(with_message=message)
+            
+        except Exception as e:
+            self.io.tool_error(f"Error capturing screenshot: {e}")
