@@ -740,6 +740,11 @@ class Model(ModelSettings):
                     self.extra_params["extra_body"] = {}
                 self.extra_params["extra_body"]["reasoning_effort"] = effort
 
+    def set_editor_reasoning_effort(self, effort):
+        """Set the reasoning effort parameter for the editor model if it exists and is different from the main model"""
+        if self.editor_model and self.editor_model is not self:
+            self.editor_model.set_reasoning_effort(effort)
+
     def parse_token_value(self, value):
         """
         Parse a token value string into an integer.
